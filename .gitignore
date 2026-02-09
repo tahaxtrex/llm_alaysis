@@ -1,0 +1,6 @@
+.env
+./env
+./outputs
+./courses
+./__pycache__
+env
