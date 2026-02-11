@@ -1,0 +1,7 @@
+pypdf
+pandas
+python-dotenv
+matplotlib
+anthropic
+google-genai
+jsonschema

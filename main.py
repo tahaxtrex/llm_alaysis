@@ -1,129 +1,124 @@
-import os, re
+import argparse
+import sys
 from pathlib import Path
-from dotenv import load_dotenv
-from pypdf import PdfReader
-from google import genai
-from google.genai import types
+import database
+import pipeline
+import llm
+import analysis
 
-load_dotenv()
+def cmd_ingest(args):
+    print("Initializing Database...")
+    database.init_db()
+    
+    courses_dir = Path(args.courses_dir)
+    print(f"Scanning {courses_dir}...")
+    pipeline.scan_and_ingest(courses_dir, semantic=not args.no_semantic)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+def cmd_evaluate(args):
+    print("Checking for unevaluated sections...")
+    # Default to Claude, fallback to Gemini in llm.py
+    model_name = args.model
+    
+    sections = database.get_unevaluated_sections(model_name)
+    print(f"Found {len(sections)} sections to evaluate.")
+    
+    limit = args.limit
+    count = 0
+    
+    import time
+    for section in sections:
+        if limit and count >= limit:
+            break
+            
+        print(f"Evaluating section {section['id']} of {section['filename']}...")
+        result = llm.evaluate_section(section['content'], preferred_model=model_name)
+        
+        if result:
+            database.save_evaluation(section['id'], model_name, result)
+            count += 1
+            print("  -> Saved.")
+        else:
+            print("  -> Failed / Skipped.")
+        
+        time.sleep(2)
 
-COURSES_DIR = Path(os.getenv("COURSES_DIR", "./courses"))
-OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./outputs"))
-MAX_CHARS = int(os.getenv("MAX_CHARS", "120000"))
+def cmd_report(args):
+    print("Generating reports...")
+    analysis.run_analysis()
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("Missing GEMINI_API_KEY in .env")
+def cmd_reset(args):
+    db_path = Path("course_analysis.db")
+    if db_path.exists():
+        confirm = input(f"Are you sure you want to delete {db_path}? (y/N): ")
+        if confirm.lower() == 'y':
+            db_path.unlink()
+            print("Database deleted.")
+            # Verify and recreate empty DB
+            database.init_db()
+            print("Database re-initialized empty.")
+    else:
+        print("Database does not exist.")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
 
-def extract_pdf_text(pdf_path: Path) -> str:
-    reader = PdfReader(str(pdf_path))
-    parts = [(page.extract_text() or "") for page in reader.pages]
-    raw = "\n".join(parts)
-    raw = re.sub(r"[ \t]+", " ", raw)
-    raw = re.sub(r"\n\s+\n", "\n\n", raw)
-    return raw.strip()
-
-def safe_name(name: str) -> str:
-    base = Path(name).stem
-    return re.sub(r"[^\w\-]+", "_", base)
-
-def build_system_prompt() -> str:
-    return "\n".join([
-        "You evaluate educational texts for pedagogical quality.",
-        "Assume factual correctness; do not verify truth.",
-        "Do not invent missing information; if something isn't present, say it's missing.",
-        "Be concise and evidence-based; include short quotes as evidence.",
-        "Return Markdown only.",
-    ])
-
-def build_user_prompt(filename: str, text: str) -> str:
-    return f"""
-You are given one course document extracted from a PDF.
-
-File: {filename}
-
-Rubrics (score 1-10, 1=absent, 10=excellent):
-- **Rubric 1** : Goal focus, meaning is the text actually explaining or focusing on what should be explained rather than stating fluff and explaining unecessary ideas
-- **Rubric 2** : text readability, how easy it is to understand the actual text of a course and how much time is spend understanding fancy words rather than concepts
-- **Rubric 3** : pedagogic clarity : does the text avoid unexplained jargon? Is the sentence structure simple enough for the target audience?
-    - **4 :** Prerequisite Alignment**:** Does the material introduce Concept B before Concept A has been explained? Or states that that knowlegde is required
-- **Rubric 5 (fluidity, continuity)** : Do the transitions between paragraphs and modules feel natural, or does the text jump abruptly between unrelated topics?
-- **Rubric 6 :** Are the examples used, if any, concrete and relatable to the target audience?
-- **Rubric 7** : examples coherent between modules.
-
-Output format (Markdown):
-# <File name>
-## Scores
-- Rubric 1: X/10 — <1 sentence>
-- Rubric 2: X/10 — <1 sentence>
-- Rubric 3: X/10 — <1 sentence>
-- Rubric 4: X/10 — <1 sentence>
-- Rubric 5: X/10 — <1 sentence>
-- Rubric 6: X/10 — <1 sentence>
-- Rubric 7: X/10 — <1 sentence>
-
-## Key issues found
-- ...
-
-## Suggested fixes
-- ...
-
-## Evidence (short quotes)
-- "..."
-
-Course text:
-<<<
-{text}
->>>
-""".strip()
-
-def call_llm(system: str, user: str) -> str:
-    # Gemini 3 supports "thinking" controls; optional.
-    # If your SDK/version doesn’t accept this config, remove config=...
-    resp = client.models.generate_content(
-        model=MODEL,
-        contents=[
-            {"role": "user", "parts": [{"text": user}]},
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            system_instruction=system,
-            # Optional thinking control (Gemini 3/2.5):
-            # thinking_config=types.ThinkingConfig(thinking_level="low")
-        ),
-    )
-    return (resp.text or "").strip()
+def cmd_synthesize(args):
+    print("Synthesizing reports for all courses...")
+    courses = database.get_all_courses()
+    for course in courses:
+        print(f"Synthesizing {course["filename"]}...")
+        evals = database.get_course_evaluations(course["id"])
+        if not evals:
+            print(f"  -> No evaluations found for {course["filename"]}. Skip.")
+            continue
+        
+        report = llm.synthesize_course_report(evals, model_name=args.model)
+        if report:
+            database.save_synthesis(course["id"], args.model, report)
+            # Also save to disk
+            out_path = Path("outputs") / f"{course["filename"].replace(".pdf", "")}_synthesis.md"
+            with open(out_path, "w") as f_out:
+                f_out.write(report)
+            print(f"  -> Saved to DB and {out_path}")
+        else:
+            print("  -> Synthesis failed.")
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    pdfs = sorted([p for p in COURSES_DIR.iterdir() if p.suffix.lower() == ".pdf"])
-    if not pdfs:
-        print(f"No PDFs found in {COURSES_DIR.resolve()}")
-        return
+    parser = argparse.ArgumentParser(description="Course Analysis Engine")
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    
+    # Ingest
+    parser_ingest = subparsers.add_parser("ingest", help="Scan and ingest PDFs")
+    parser_ingest.add_argument("--courses-dir", default="./courses", help="Directory containing PDFs")
+    parser_ingest.add_argument("--no-semantic", action="store_true", help="Disable semantic segmentation")
+    
+    # Evaluate
+    parser_evaluate = subparsers.add_parser("evaluate", help="Run LLM evaluation")
+    parser_evaluate.add_argument("--model", default="claude", help="Model to use (claude/gemini)")
+    parser_evaluate.add_argument("--limit", type=int, default=None, help="Limit number of sections to evaluate")
+    
+    # Report
+    parser_report = subparsers.add_parser("report", help="Generate analysis reports")
+    
+    # Reset
+    parser_reset = subparsers.add_parser("reset", help="Reset database")
+    
 
-    system = build_system_prompt()
-
-    for pdf_path in pdfs:
-        print(f"Processing: {pdf_path.name}")
-        text = extract_pdf_text(pdf_path)
-        if not text:
-            print(f"  Skipped (no text extracted): {pdf_path.name}")
-            continue
-
-        truncated = text[:MAX_CHARS]
-        user = build_user_prompt(pdf_path.name, truncated)
-        output = call_llm(system, user)
-
-        out_path = OUTPUT_DIR / f"{safe_name(pdf_path.name)}.md"
-        header = f"<!-- model={MODEL} originalChars={len(text)} sentChars={len(truncated)} -->\n\n"
-        out_path.write_text(header + output, encoding="utf-8")
-        print(f"  Wrote: {out_path}")
-
-    print("Done.")
+    # Synthesize
+    parser_synth = subparsers.add_parser("synthesize", help="Generate a high-level course synthesis")
+    parser_synth.add_argument("--model", default="claude", help="Model to use")
+    args = parser.parse_args()
+    
+    if args.command == "ingest":
+        cmd_ingest(args)
+    elif args.command == "evaluate":
+        cmd_evaluate(args)
+    elif args.command == "report":
+        cmd_report(args)
+    elif args.command == "synthesize":
+        cmd_synthesize(args)
+    elif args.command == "reset":
+        cmd_reset(args)
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()
