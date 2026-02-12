@@ -23,11 +23,6 @@ def extract_text_from_pdf(filepath: Path) -> str:
             if page_text:
                 text += page_text + "\n"
         
-        # Basic cleanup
-        # Remove null bytes
-        text = text.replace("\x00", "") 
-        # Normalize whitespace (but keep newlines for structure detection)
-        # We might want to be careful not to destroy paragraph structure
         return text.strip()
     except Exception as e:
         print(f"Error extracting {filepath}: {e}")
@@ -35,93 +30,71 @@ def extract_text_from_pdf(filepath: Path) -> str:
 
 def is_heading(line: str) -> bool:
     line = line.strip()
-    if not line:
-        return False
-    
-    # 1. Numbered headings: "1. Introduction", "2.1. Concepts"
-    # Matches starting with digit+dot
-    if re.match(r"^\d+(\.\d+)*\s", line):
+    if not line: return False
+    # Identify common textbook headings
+    if re.match(r"^(Chapter|Module|Section|Unit)\s+\d+", line, re.I):
         return True
-        
-    # 2. ALL CAPS shorter than 60 chars (and at least 4 chars to avoid tiny noise)
-    if line.isupper() and 4 < len(line) < 60:
+    if re.match(r"^\d+(\.\d)?\s+[A-Z]", line):
         return True
-        
     return False
 
-
 def segment_text(text: str, semantic: bool = True) -> List[str]:
-    """Segment text into modules. If semantic=True, use LLM to refine boundaries."""
-    if not semantic:
-        # Fallback to existing logic
-        lines = text.split("\n")
-        sections = []
-        current_section = []
-        current_size = 0
-        for line in lines:
-            line_len = len(line)
-            if is_heading(line) and current_size > 1000:
-                if current_section:
-                    sections.append("\n".join(current_section))
-                current_section = [line]
-                current_size = line_len
-                continue
-            if current_size > 12000:
-                 if current_section:
-                    sections.append("\n".join(current_section))
-                 current_section = [line]
-                 current_size = line_len
-                 continue
-            current_section.append(line)
-            current_size += line_len + 1
-        if current_section:
-            sections.append("\n".join(current_section))
-        return sections
+    # Use LLM for semantic segmentation if requested
+    if semantic:
+        print("  -> Using LLM for semantic segmentation...")
+        return llm.find_semantic_boundaries(text)
 
-    print("  -> Using Semantic Segmentation (LLM-assisted)...")
-    # Split into 30k char blocks for LLM refinement
-    rough_chunks = [text[i:i+30000] for i in range(0, len(text), 30000)]
-    all_sections = []
-    for chunk in rough_chunks:
-        refined = llm.find_semantic_boundaries(chunk)
-        all_sections.extend(refined)
-    return all_sections
+    # Fallback to heuristic segmentation
+    lines = text.split("\n")
+    sections = []
+    current_section = []
+    current_size = 0
+    MIN_SIZE = 1000  # Reduced for testing/realism
+    MAX_SIZE = 6000 
+    
+    for line in lines:
+        if is_heading(line) and current_size > MIN_SIZE:
+            if current_section:
+                sections.append("\n".join(current_section))
+            current_section = [line]
+            current_size = len(line)
+            continue
+        
+        # Force split if section gets too large
+        if current_size > MAX_SIZE:
+            if current_section:
+                sections.append("\n".join(current_section))
+            current_section = [line]
+            current_size = len(line)
+            continue
+            
+        current_section.append(line)
+        current_size += len(line) + 1
+        
+    if current_section:
+        sections.append("\n".join(current_section))
+    return sections
 
 def ingest_course(filepath: Path, source: str = "local", semantic: bool = True):
     print(f"Ingesting {filepath.name}...")
-    file_hash = compute_file_hash(filepath)
-    
-    # Check deduplication
-    if database.course_exists(file_hash):
+    hash_val = compute_file_hash(filepath)
+    if database.course_exists(hash_val):
         print(f"Skipping {filepath.name} (already exists).")
-        return
-
+        return 
     text = extract_text_from_pdf(filepath)
     if not text:
         print(f"Warning: No text extracted from {filepath.name}")
         return
-        
-    # Insert Course
-    database.insert_course(file_hash, filepath.name, str(filepath), source)
+    database.insert_course(hash_val, filepath.name, str(filepath), source)
     
-    # Segment
+    # Pass the semantic flag to segment_text
     sections = segment_text(text, semantic=semantic)
-    print(f"  -> Extracted {len(sections)} sections.")
     
-    # Insert Sections
-    database.insert_sections(file_hash, sections)
-    print(f"  -> Saved to DB.")
+    print(f"  -> Extracted {len(sections)} sections.")
+    database.insert_sections(hash_val, sections)
 
 def scan_and_ingest(courses_dir: Path, semantic: bool = True):
-    if not courses_dir.exists():
-        print(f"Directory {courses_dir} not found.")
-        return
-
-    # recurse
-    pdf_files = sorted(courses_dir.rglob("*.pdf"))
-    print(f"Found {len(pdf_files)} PDFs in {courses_dir}")
-    
-    for pdf in pdf_files:
-        # source is parent dir name relative to root courses dir, or just direct parent
-        source = pdf.parent.name
-        ingest_course(pdf, source=source, semantic=semantic)
+    if not courses_dir.exists(): return
+    pdfs = sorted(courses_dir.rglob("*.pdf"))
+    for pdf in pdfs:
+        ingest_course(pdf, source=pdf.parent.name, semantic=semantic)
